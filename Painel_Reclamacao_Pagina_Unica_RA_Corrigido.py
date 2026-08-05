@@ -1,5 +1,6 @@
 import json
 import re
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -15,6 +16,10 @@ ARQUIVO_EXCEL = Path(r"C:/Users/GabriellyOliveira/Desktop/Processo CSOPS/07. Tes
 PASTA_SAIDA = ARQUIVO_EXCEL.parent
 ARQUIVO_SAIDA = PASTA_SAIDA / "Painel_Reclamação.html"
 ARQUIVO_BASE_COMPLETA = PASTA_SAIDA / "Base_Analitica_Reclamacao_Completa.csv"
+
+# Cópia publicada no GitHub Pages (precisa se chamar "index.html" para a URL ficar limpa)
+ARQUIVO_INDEX = PASTA_SAIDA / "index.html"
+NOME_SCRIPT = Path(__file__).name
 
 # Página pública do Reclame Aqui da Digisac.
 # Não usa login, senha nem API contratada.
@@ -50,25 +55,27 @@ def motivo_final(row, motivo_cols):
     return "Sem motivo"
 
 
-def extrair_numero_apos_linha(linhas, texto_alvo):
-    """
-    Procura uma linha que contenha o texto_alvo e retorna o primeiro número encontrado
-    nas próximas linhas.
-    """
-    texto_alvo = texto_alvo.lower()
-    for i, linha in enumerate(linhas):
-        if texto_alvo in linha.lower():
-            for prox in linhas[i + 1:i + 8]:
-                m = re.search(r"\d+(?:[.,]\d+)?%?", prox)
-                if m:
-                    return m.group(0).replace(",", ".")
+def extrair_indicador_por_rotulo(texto, rotulo, padrao_valor):
+    """Extrai um indicador mesmo quando o site coloca o valor antes ou depois do rótulo."""
+    rotulo_re = re.escape(rotulo)
+    padroes = [
+        rf"{rotulo_re}\s*[:\-]?\s*({padrao_valor})",
+        rf"({padrao_valor})\s*{rotulo_re}",
+    ]
+    for padrao in padroes:
+        m = re.search(padrao, texto, flags=re.I | re.S)
+        if m:
+            return m.group(1).strip()
     return ""
 
 
 def coletar_reclame_aqui_publico():
     """
-    Coleta automaticamente os indicadores públicos da página da Digisac no Reclame Aqui.
-    Se o site mudar ou bloquear a coleta, o painel continua gerando e os cards aparecem vazios.
+    Coleta os indicadores públicos da página da Digisac no Reclame Aqui.
+
+    O Reclame Aqui alterou os textos da página. Por isso, a coleta procura os
+    indicadores pelos rótulos atuais, aceitando o valor antes ou depois do rótulo.
+    O HTML bruto convertido em texto continua sendo salvo no arquivo de debug.
     """
     dados = {
         "url": URL_RECLAME_AQUI_PUBLICO,
@@ -88,89 +95,112 @@ def coletar_reclame_aqui_publico():
 
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/150.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
         }
 
-        resp = requests.get(URL_RECLAME_AQUI_PUBLICO, headers=headers, timeout=40)
+        sessao = requests.Session()
+        resp = sessao.get(URL_RECLAME_AQUI_PUBLICO, headers=headers, timeout=40)
         resp.raise_for_status()
 
         soup = BeautifulSoup(resp.text, "html.parser")
         texto = soup.get_text("\n", strip=True)
         ARQUIVO_RECLAME_AQUI_DEBUG.write_text(texto, encoding="utf-8")
 
-        linhas = [l.strip() for l in texto.splitlines() if l.strip()]
-        texto_unico = "\n".join(linhas)
+        linhas = [linha.strip() for linha in texto.splitlines() if linha.strip()]
+        texto_unico = " ".join(linhas)
+        texto_unico = re.sub(r"\s+", " ", texto_unico)
 
-        # Reputação: normalmente aparece logo depois da palavra "Reputação".
-        for i, linha in enumerate(linhas):
-            if linha.strip().lower() == "reputação" and i + 1 < len(linhas):
-                dados["reputacao"] = linhas[i + 1].strip()
-                break
-
-        # Nota média de reputação nos últimos 6 meses.
+        # Reputação atual.
         m = re.search(
-            r"nota média nos últimos 6 meses é\s*\n?\s*(\d+(?:[.,]\d+)?)\s*\n?\s*/10",
+            r"Reputa(?:ção|cao)\s+(Ótima|Otima|Boa|Regular|Ruim|Péssima|Pessima|Não recomendada|Nao recomendada|Sem índice|Sem indice)",
             texto_unico,
-            flags=re.I
+            flags=re.I,
+        )
+        if not m:
+            m = re.search(
+                r"avaliou o atendimento dessa empresa como\s+(ótimo|otimo|bom|regular|ruim|péssimo|pessimo)",
+                texto_unico,
+                flags=re.I,
+            )
+        if m:
+            reputacao = m.group(1).strip().capitalize()
+            mapa_rep = {
+                "Ótimo": "Ótima", "Otimo": "Ótima",
+                "Bom": "Boa", "Péssimo": "Péssima", "Pessimo": "Péssima",
+            }
+            dados["reputacao"] = mapa_rep.get(reputacao, reputacao)
+
+        # Nota média: aceita 6 ou 12 meses e texto com ou sem a palavra "é".
+        m = re.search(
+            r"nota média nos últimos\s+(?:6|12)\s+meses(?:\s+é)?\s*(\d+(?:[.,]\d+)?)\s*/\s*10",
+            texto_unico,
+            flags=re.I,
         )
         if m:
             dados["nota_media_reputacao"] = m.group(1).replace(",", ".")
 
-        # Quantidade de reclamações recebidas.
-        m = re.search(r"recebeu\s*\n?\s*(\d+)\s+reclamaç", texto_unico, flags=re.I)
-        if m:
-            dados["qtd_reclamacoes"] = m.group(1)
-
-        # Percentual respondido.
-        m = re.search(r"Respondeu\s*\n?\s*(\d+(?:[.,]\d+)?%)", texto_unico, flags=re.I)
-        if m:
-            dados["reclamacoes_respondidas_pct"] = m.group(1).replace(",", ".")
-
-        # Não respondidas.
-        m = re.search(r"Há\s*\n?\s*(\d+)\s+reclamaç[aã]o\s*\n?\s*aguardando resposta", texto_unico, flags=re.I)
-        if m:
-            dados["nao_respondidas"] = m.group(1)
-
-        # Avaliadas e nota do consumidor.
-        m = re.search(
-            r"Há\s*\n?\s*(\d+)\s+reclamações\s*\n?\s*avaliadas.*?é\s*\n?\s*(\d+(?:[.,]\d+)?)",
+        # Indicadores no formato atual da página.
+        dados["qtd_reclamacoes"] = extrair_indicador_por_rotulo(
+            texto_unico, "Reclamações recebidas", r"\d+"
+        )
+        dados["reclamacoes_respondidas_pct"] = extrair_indicador_por_rotulo(
+            texto_unico, "Reclamações respondidas", r"\d+(?:[.,]\d+)?%"
+        )
+        dados["nao_respondidas"] = extrair_indicador_por_rotulo(
+            texto_unico, "Aguardando resposta", r"\d+"
+        )
+        dados["indice_solucao_pct"] = extrair_indicador_por_rotulo(
+            texto_unico, "Reclamações resolvidas", r"\d+(?:[.,]\d+)?%"
+        )
+        dados["voltariam_fazer_negocio_pct"] = extrair_indicador_por_rotulo(
+            texto_unico, "Voltariam a fazer negócio", r"\d+(?:[.,]\d+)?%"
+        )
+        dados["avaliadas"] = extrair_indicador_por_rotulo(
+            texto_unico, "Reclamações avaliadas", r"\d+"
+        )
+        dados["nota_consumidor"] = extrair_indicador_por_rotulo(
+            texto_unico, "Nota média do consumidor", r"\d+(?:[.,]\d+)?"
+        )
+        dados["tempo_medio_resposta"] = extrair_indicador_por_rotulo(
             texto_unico,
-            flags=re.I | re.S
+            "Tempo médio de resposta",
+            r"\d+\s+(?:dias?|horas?)(?:\s+e\s+\d+\s+(?:dias?|horas?))?",
+        )
+
+        # Período atual: "Dados de 01/02/2026 até 31/07/2026".
+        m = re.search(
+            r"Dados de\s*(\d{2}/\d{2}/\d{4})\s*(?:até|a)\s*(\d{2}/\d{2}/\d{4})",
+            texto_unico,
+            flags=re.I,
         )
         if m:
-            dados["avaliadas"] = m.group(1)
-            dados["nota_consumidor"] = m.group(2).replace(",", ".")
+            dados["periodo"] = f"{m.group(1)} a {m.group(2)}"
 
-        # Voltariam a fazer negócio.
-        m = re.search(r"Dos que avaliaram,\s*\n?\s*(\d+(?:[.,]\d+)?%)\s+voltariam", texto_unico, flags=re.I)
-        if m:
-            dados["voltariam_fazer_negocio_pct"] = m.group(1).replace(",", ".")
+        encontrados = sum(bool(v) for k, v in dados.items() if k not in {"url", "coletado_em"})
+        print(f"[RECLAME AQUI] Indicadores encontrados: {encontrados}/10")
+        print(f"[RECLAME AQUI] Dados coletados: {dados}")
 
-        # Índice de solução.
-        m = re.search(r"resolveu\s*\n?\s*(\d+(?:[.,]\d+)?%)\s+das reclamações", texto_unico, flags=re.I)
-        if m:
-            dados["indice_solucao_pct"] = m.group(1).replace(",", ".")
-
-        # Tempo médio de resposta.
-        m = re.search(r"O tempo médio de resposta é\s*\n?\s*([^\n]+)", texto_unico, flags=re.I)
-        if m:
-            dados["tempo_medio_resposta"] = m.group(1).strip()
-
-        # Período.
-        m = re.search(
-            r"Os dados correspondem ao período de\s*\n?\s*(\d{2}/\d{2}/\d{4}\s+a\s+\d{2}/\d{2}/\d{4})",
-            texto_unico,
-            flags=re.I
-        )
-        if m:
-            dados["periodo"] = m.group(1)
-
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "desconhecido"
+        print(f"[AVISO] Reclame Aqui bloqueou ou recusou a consulta HTTP. Status: {status}")
+        print(f"[AVISO] Consulte o arquivo de debug: {ARQUIVO_RECLAME_AQUI_DEBUG}")
     except Exception as e:
         print(f"[AVISO] Não foi possível coletar os dados públicos do Reclame Aqui: {e}")
 
-    pd.DataFrame([dados]).to_csv(ARQUIVO_RECLAME_AQUI_CSV, index=False, sep=";", encoding="utf-8-sig")
+    pd.DataFrame([dados]).to_csv(
+        ARQUIVO_RECLAME_AQUI_CSV,
+        index=False,
+        sep=";",
+        encoding="utf-8-sig",
+    )
     return dados
 
 # ============================================================
@@ -302,7 +332,7 @@ html = r'''
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Painel Reclamação</title>
+<title>Relatório de Reclamação - Página Única</title>
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
 <script src="https://unpkg.com/lucide@latest"></script>
 <style>
@@ -314,7 +344,7 @@ html = r'''
 *{box-sizing:border-box} body{margin:0;background:var(--bg);font-family:Segoe UI,Arial,sans-serif;color:var(--text)}
 .app{display:flex;min-height:100vh}.side{width:88px;background:#fff;border-right:1px solid #e6eef5;display:flex;flex-direction:column;align-items:center;padding-top:170px;gap:42px;position:fixed;left:0;top:0;bottom:0}.nav{width:70px;height:70px;border-radius:50%;display:flex;align-items:center;justify-content:center;color:#8fa0ad;cursor:pointer}.nav.active{background:var(--cyan2);color:var(--cyan);}.nav.green.active{background:var(--greenSoft)}
 .lucide{width:22px;height:22px;stroke-width:2.2}.nav .lucide{width:24px;height:24px}.icon-badge .lucide{width:19px;height:19px;color:var(--cyan)}.home-card .icon-badge .lucide{width:30px;height:30px}.return .lucide{width:30px;height:30px;color:#3898db;stroke-width:2.4}
-.main{margin-left:88px;width:calc(100% - 88px);padding:8px 16px 24px}.app.home-mode .side{display:none}.app.home-mode .main{margin-left:0;width:100%;padding:0}.app.home-mode .home-cover{min-height:100vh}.page{display:none}.page.active{display:block}.hero{background:#fff;border:1px solid var(--border);border-radius:20px;box-shadow:var(--shadow);padding:18px 22px;margin-bottom:18px}.hero-title{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}.h-left{display:flex;align-items:center;gap:12px}.icon-badge{width:34px;height:34px;border-radius:50%;background:var(--cyan2);display:flex;align-items:center;justify-content:center;color:var(--cyan);font-weight:800;font-size:18px}.hero h1{margin:0;font-size:30px;line-height:1;font-weight:800;color:#222}.return{font-size:34px;color:#3898db}.filters{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.filters.three{grid-template-columns:repeat(3,1fr)}.fg label{display:block;font-weight:700;font-size:16px;margin:0 0 4px;color:#3d4650}.fg select{width:100%;height:45px;border:1px solid #cbd6e2;border-radius:8px;background:white;padding:0 12px;font-size:15px;color:#666;outline:none}
+.main{margin-left:0;width:100%;padding:0 18px 30px}.side{display:none!important}.page{display:block!important;scroll-margin-top:18px}.page+.page{margin-top:28px}#page-home{margin:0 -18px 28px}.hero{background:#fff;border:1px solid var(--border);border-radius:20px;box-shadow:var(--shadow);padding:18px 22px;margin-bottom:18px}.hero-title{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}.h-left{display:flex;align-items:center;gap:12px}.section-heading{display:flex;flex-direction:column;gap:4px}.hero-subtitle{font-size:14px;line-height:1.4;color:var(--muted);font-weight:500}.icon-badge{width:34px;height:34px;border-radius:50%;background:var(--cyan2);display:flex;align-items:center;justify-content:center;color:var(--cyan);font-weight:800;font-size:18px}.hero h1{margin:0;font-size:30px;line-height:1;font-weight:800;color:#222}.return{font-size:34px;color:#3898db}.filters{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.filters.three{grid-template-columns:repeat(3,1fr)}.fg label{display:block;font-weight:700;font-size:16px;margin:0 0 4px;color:#3d4650}.fg select{width:100%;height:45px;border:1px solid #cbd6e2;border-radius:8px;background:white;padding:0 12px;font-size:15px;color:#666;outline:none}
 .fg select[multiple]{display:none}
 .ms-wrap{position:relative;width:100%}
 .ms-display{height:45px;border:1px solid #cbd6e2;border-radius:8px;background:#fff;padding:0 38px 0 12px;font-size:15px;color:#1f2937;display:flex;align-items:center;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -326,7 +356,7 @@ html = r'''
 .ms-btn{border:1px solid #d7e4ee;background:#f8fbff;color:#063f78;border-radius:8px;padding:8px 12px;font-size:12px;font-weight:800;cursor:pointer}
 .ms-option{display:flex;align-items:center;gap:8px;padding:7px 4px;font-size:14px;color:#1f2937;cursor:pointer}
 .ms-option input{width:14px;height:14px;accent-color:var(--cyan)}
-.home-subtitle{max-width:650px;margin-top:-36px;margin-bottom:44px;font-size:17px;line-height:1.55;color:#eafcff}
+.home-subtitle{max-width:900px;margin:0;font-size:15px;line-height:1.45;color:#eafcff}
 .home-updated{position:absolute;right:40px;bottom:36px;font-size:16px;color:#fff;display:flex;align-items:center;gap:10px}.home-updated:before{content:"";width:8px;height:8px;border-radius:50%;background:#a9f3ff;display:inline-block}
 .home-cover{position:relative}
 .base-analitica{margin-top:34px}
@@ -344,8 +374,8 @@ html = r'''
 .ra-label-row{display:flex;align-items:center;justify-content:space-between;gap:4px;margin-bottom:5px}
 .ra-value{font-size:20px;font-weight:900;color:#071f3f;line-height:1.05}
 .ra-value.cyan{color:var(--cyan)}
-.ra-sub{font-size:11px;color:#7890ad;margin-top:5px;line-height:1.2}.section-title{font-size:20px;font-weight:700;margin:0 0 6px;color:#333}.chart-grid-2{display:grid;grid-template-columns:1fr 1fr;gap:34px 40px}.chart-box h3{margin:0 0 8px;font-size:18px;color:#333}.plot{height:180px}.plot.tall{height:250px}.dept-main{height:145px}.month-dept{height:160px}#chartDeptoAno,#chartDeptoMes{border-radius:18px;overflow:hidden;background:#fff}#chartDeptoAno .main-svg,#chartDeptoMes .main-svg{border-radius:18px}.summary{font-size:15px;line-height:1.55;color:#24364b;padding:22px}.summary h3{margin:0 0 14px;font-size:22px;color:#061d3a}.summary b{font-weight:800}.motivos-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.motivo-card{border:1px solid var(--border);border-radius:16px;background:#fff;padding:18px}.motivo-head{display:flex;justify-content:space-between;align-items:flex-start}.motivo-head h3{font-size:18px;margin:0}.motivo-total{color:var(--cyan);font-size:28px;font-weight:800;text-align:right}.small-muted{font-size:13px;color:#7890ad;margin-top:4px}.mini-table{width:100%;border-collapse:collapse;margin-top:18px;font-size:13px}.mini-table th{text-align:left;color:#5c6f88;font-size:13px;border-bottom:1px solid #d7e4ee;padding:9px}.mini-table td{border-bottom:1px solid #edf2f6;padding:9px}.mini-table th:nth-child(2),.mini-table td:nth-child(2){text-align:center;font-weight:700}.mini-table th:nth-child(3),.mini-table td:nth-child(3){text-align:right;color:#5e7390}.analytics-head{display:flex;justify-content:space-between;gap:14px;align-items:center}.btns{display:flex;gap:8px;flex-wrap:wrap}.btn{border:1px solid var(--border);background:#fff;color:#1d5d88;border-radius:10px;padding:10px 12px;font-weight:700;cursor:pointer}.btn.primary{background:var(--cyan);border-color:var(--cyan);color:#fff}.table-wrap{max-height:360px;overflow:auto;border:1px solid var(--border);border-radius:8px;background:#fff}.detail-table{width:100%;border-collapse:collapse;font-size:12px}.detail-table th{position:sticky;top:0;background:#f6f9fc;color:#60738f;text-align:left;padding:12px;border-bottom:1px solid #e7edf3}.detail-table td{padding:12px;border-bottom:1px solid #edf2f6;vertical-align:top}.pill{display:inline-block;background:var(--cyan2);color:#0e91a7;border-radius:999px;padding:5px 10px;font-weight:800;font-size:12px}.quality-grid{display:grid;grid-template-columns:minmax(0,.85fr) minmax(0,1fr) minmax(0,1.25fr);gap:14px;align-items:start;width:100%;overflow:hidden}.quality-grid>div{min-width:0}.status-card{border:1px solid var(--border);border-radius:16px;padding:18px;margin-bottom:16px}.status-card h3{margin:0 0 2px;font-size:21px}.status-num{float:right;color:var(--cyan);font-size:30px;font-weight:800}.bar-bg{height:8px;background:#e5e9ef;border-radius:999px;margin:14px 0 8px}.bar{height:8px;background:var(--cyan);border-radius:999px}.mini-kpis{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-bottom:18px;align-items:stretch;width:100%}.mini-card{border:1px solid var(--border);border-radius:16px;padding:18px 20px;background:#fff;min-height:128px;height:128px;display:grid;grid-template-rows:28px 1fr 20px;align-items:center;overflow:visible}.mini-title{font-weight:700;color:#6b7280;font-size:13px;margin:0;display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0}.info-tip{position:relative;display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:50%;background:var(--cyan2);color:var(--cyan);font-weight:900;font-size:14px;cursor:help;flex:0 0 auto}.info-tip::after{content:attr(data-tip);display:none;position:absolute;right:-8px;top:30px;width:300px;background:#1f3f68;color:#fff;border-radius:12px;padding:12px 14px;font-size:13px;line-height:1.45;font-weight:600;box-shadow:0 10px 24px rgba(0,0,0,.18);z-index:80;white-space:normal}.info-tip::before{content:"";display:none;position:absolute;right:3px;top:23px;border-left:8px solid transparent;border-right:8px solid transparent;border-bottom:8px solid #1f3f68;z-index:81}.info-tip:hover::after,.info-tip:hover::before{display:block}.yesno{display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:end;width:100%;grid-row:2 / 4}.yesno>div{display:grid;grid-template-rows:20px 42px;align-items:end}.big-cyan{font-size:34px;color:var(--cyan);font-weight:800;line-height:1}.mini-card>.big-cyan{grid-row:2;align-self:end}.mini-card>.small-muted{grid-row:3;align-self:end;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.note-row{display:flex;justify-content:space-between;font-size:14px;margin:14px 0 5px}.toast{position:fixed;right:22px;bottom:22px;background:#122235;color:#fff;padding:12px 16px;border-radius:12px;display:none;z-index:99}.return{cursor:pointer}.home-cover{min-height:720px;background:var(--cyan);border-radius:0;padding:38px 34px;color:white}.brand{font-size:34px;font-weight:800;letter-spacing:-1px}.home-title{font-size:78px;line-height:1.02;font-weight:300;margin:70px 0 55px;color:#cff6ff}.home-title b{font-weight:700;color:#fff}.home-cards{display:grid;grid-template-columns:repeat(4,minmax(210px,1fr));gap:30px;max-width:1180px}.home-card{background:#fff;color:#202124;border-radius:22px;min-height:235px;padding:52px 26px 24px;cursor:pointer;box-shadow:0 10px 24px rgba(0,0,0,.08);transition:.18s}.home-card:hover{transform:translateY(-3px)}.home-card .icon-badge{width:64px;height:64px;font-size:28px;margin-bottom:26px}.home-card h2{font-size:25px;line-height:1.05;margin:0}.home-card p{margin:12px 0 0;font-size:15px;line-height:1.35;color:#5f6f83;max-width:210px}.home-footer{font-size:34px;font-weight:800;margin-top:55px}.csvbox{display:none;width:100%;height:180px;margin-top:10px;border:1px solid var(--border);border-radius:10px;padding:10px;font-family:Consolas,monospace;font-size:12px}.tag-scroll{max-height:680px;overflow-y:auto;padding-right:4px;scrollbar-width:thin;scrollbar-color:var(--cyan) #e5e9ef}.tag-scroll::-webkit-scrollbar{width:6px}.tag-scroll::-webkit-scrollbar-track{background:#e5e9ef;border-radius:999px}.tag-scroll::-webkit-scrollbar-thumb{background:var(--cyan);border-radius:999px}
-@media(max-width:1100px){.filters,.filters.three,.chart-grid-2,.motivos-grid,.quality-grid,.geral-top,.ra-cards,.ra-cards-all{grid-template-columns:1fr}.main{margin-left:0;width:100%}.side{display:none}.hero h1{font-size:24px}.kpi{width:100%}}
+.ra-sub{font-size:11px;color:#7890ad;margin-top:5px;line-height:1.2}.section-title{font-size:20px;font-weight:700;margin:0 0 6px;color:#333}.chart-grid-2{display:grid;grid-template-columns:1fr 1fr;gap:34px 40px}.chart-box h3{margin:0 0 8px;font-size:18px;color:#333}.plot{height:180px}.plot.tall{height:250px}.dept-main{height:145px}.month-dept{height:160px}#chartDeptoAno,#chartDeptoMes{border-radius:18px;overflow:hidden;background:#fff}#chartDeptoAno .main-svg,#chartDeptoMes .main-svg{border-radius:18px}.summary{font-size:15px;line-height:1.55;color:#24364b;padding:22px}.summary h3{margin:0 0 14px;font-size:22px;color:#061d3a}.summary b{font-weight:800}.motivos-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.motivo-card{border:1px solid var(--border);border-radius:16px;background:#fff;padding:18px}.motivo-head{display:flex;justify-content:space-between;align-items:flex-start}.motivo-head h3{font-size:18px;margin:0}.motivo-total{color:var(--cyan);font-size:28px;font-weight:800;text-align:right}.small-muted{font-size:13px;color:#7890ad;margin-top:4px}.mini-table{width:100%;border-collapse:collapse;margin-top:18px;font-size:13px}.mini-table th{text-align:left;color:#5c6f88;font-size:13px;border-bottom:1px solid #d7e4ee;padding:9px}.mini-table td{border-bottom:1px solid #edf2f6;padding:9px}.mini-table th:nth-child(2),.mini-table td:nth-child(2){text-align:center;font-weight:700}.mini-table th:nth-child(3),.mini-table td:nth-child(3){text-align:right;color:#5e7390}.analytics-head{display:flex;justify-content:space-between;gap:14px;align-items:center}.btns{display:flex;gap:8px;flex-wrap:wrap}.btn{border:1px solid var(--border);background:#fff;color:#1d5d88;border-radius:10px;padding:10px 12px;font-weight:700;cursor:pointer}.btn.primary{background:var(--cyan);border-color:var(--cyan);color:#fff}.table-wrap{max-height:360px;overflow:auto;border:1px solid var(--border);border-radius:8px;background:#fff}.detail-table{width:100%;border-collapse:collapse;font-size:12px}.detail-table th{position:sticky;top:0;background:#f6f9fc;color:#60738f;text-align:left;padding:12px;border-bottom:1px solid #e7edf3}.detail-table td{padding:12px;border-bottom:1px solid #edf2f6;vertical-align:top}.pill{display:inline-block;background:var(--cyan2);color:#0e91a7;border-radius:999px;padding:5px 10px;font-weight:800;font-size:12px}.quality-grid{display:grid;grid-template-columns:minmax(0,.85fr) minmax(0,1fr) minmax(0,1.25fr);gap:14px;align-items:start;width:100%;overflow:hidden}.quality-grid>div{min-width:0}.status-card{border:1px solid var(--border);border-radius:16px;padding:18px;margin-bottom:16px}.status-card h3{margin:0 0 2px;font-size:21px}.status-num{float:right;color:var(--cyan);font-size:30px;font-weight:800}.bar-bg{height:8px;background:#e5e9ef;border-radius:999px;margin:14px 0 8px}.bar{height:8px;background:var(--cyan);border-radius:999px}.mini-kpis{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-bottom:18px;align-items:stretch;width:100%}.mini-card{border:1px solid var(--border);border-radius:16px;padding:18px 20px;background:#fff;min-height:128px;height:128px;display:grid;grid-template-rows:28px 1fr 20px;align-items:center;overflow:visible}.mini-title{font-weight:700;color:#6b7280;font-size:13px;margin:0;display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0}.info-tip{position:relative;display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:50%;background:var(--cyan2);color:var(--cyan);font-weight:900;font-size:14px;cursor:help;flex:0 0 auto}.info-tip::after{content:attr(data-tip);display:none;position:absolute;right:-8px;top:30px;width:300px;background:#1f3f68;color:#fff;border-radius:12px;padding:12px 14px;font-size:13px;line-height:1.45;font-weight:600;box-shadow:0 10px 24px rgba(0,0,0,.18);z-index:80;white-space:normal}.info-tip::before{content:"";display:none;position:absolute;right:3px;top:23px;border-left:8px solid transparent;border-right:8px solid transparent;border-bottom:8px solid #1f3f68;z-index:81}.info-tip:hover::after,.info-tip:hover::before{display:block}.yesno{display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:end;width:100%;grid-row:2 / 4}.yesno>div{display:grid;grid-template-rows:20px 42px;align-items:end}.big-cyan{font-size:34px;color:var(--cyan);font-weight:800;line-height:1}.mini-card>.big-cyan{grid-row:2;align-self:end}.mini-card>.small-muted{grid-row:3;align-self:end;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.note-row{display:flex;justify-content:space-between;font-size:14px;margin:14px 0 5px}.toast{position:fixed;right:22px;bottom:22px;background:#122235;color:#fff;padding:12px 16px;border-radius:12px;display:none;z-index:99}.return{cursor:pointer}.home-cover{min-height:auto;background:var(--cyan);border-radius:0 0 26px 26px;padding:22px 34px 24px;color:white}.brand{font-size:34px;font-weight:800;letter-spacing:-1px}.home-title{font-size:48px;line-height:1.02;font-weight:300;margin:18px 0 12px;color:#cff6ff}.home-title b{font-weight:700;color:#fff}.home-cards{display:grid;grid-template-columns:repeat(4,minmax(180px,1fr));gap:16px;max-width:1180px}.home-card{background:#fff;color:#202124;border-radius:18px;min-height:150px;padding:20px;cursor:pointer;box-shadow:0 10px 24px rgba(0,0,0,.08);transition:.18s}.home-card:hover{transform:translateY(-3px)}.home-card .icon-badge{width:48px;height:48px;font-size:24px;margin-bottom:14px}.home-card h2{font-size:20px;line-height:1.1;margin:0}.home-card p{margin:12px 0 0;font-size:15px;line-height:1.35;color:#5f6f83;max-width:210px}.home-footer{font-size:24px;font-weight:800;margin-top:18px}.csvbox{display:none;width:100%;height:180px;margin-top:10px;border:1px solid var(--border);border-radius:10px;padding:10px;font-family:Consolas,monospace;font-size:12px}.tag-scroll{max-height:680px;overflow-y:auto;padding-right:4px;scrollbar-width:thin;scrollbar-color:var(--cyan) #e5e9ef}.tag-scroll::-webkit-scrollbar{width:6px}.tag-scroll::-webkit-scrollbar-track{background:#e5e9ef;border-radius:999px}.tag-scroll::-webkit-scrollbar-thumb{background:var(--cyan);border-radius:999px}
+@media(max-width:1100px){.hero-subtitle{font-size:13px}.filters,.filters.three,.chart-grid-2,.motivos-grid,.quality-grid,.geral-top,.ra-cards,.ra-cards-all{grid-template-columns:1fr}.main{margin-left:0;width:100%}.side{display:none}.hero h1{font-size:24px}.kpi{width:100%}}
 </style>
 </head>
 <body>
@@ -363,34 +393,12 @@ html = r'''
         <div class="brand">●digisac</div>
         <div class="home-title">Relatório de<br><b>Reclamação</b></div>
         <div class="home-subtitle">Painel executivo para acompanhar reclamações, canais de entrada, departamentos responsáveis, motivos recorrentes, status de tratativa, qualidade do atendimento e base analítica do período.</div>
-        <div class="home-cards">
-          <div class="home-card" onclick="showPage('geral')">
-            <span class="icon-badge"><i data-lucide="chart-line"></i></span>
-            <h2>Visão Geral</h2>
-            <p>KPIs, evolução mensal e canais de entrada.</p>
-          </div>
-          <div class="home-card" onclick="showPage('depto')">
-            <span class="icon-badge"><i data-lucide="building-2"></i></span>
-            <h2>Participação das<br>Áreas</h2>
-            <p>Distribuição das ocorrências por área responsável.</p>
-          </div>
-          <div class="home-card" onclick="showPage('motivos')">
-            <span class="icon-badge"><i data-lucide="clipboard-list"></i></span>
-            <h2>Motivos & Ocorrências</h2>
-            <p>Principais motivos, padrões e base analítica.</p>
-          </div>
-          <div class="home-card" onclick="showPage('qualidade')">
-            <span class="icon-badge"><i data-lucide="headphones"></i></span>
-            <h2>Qualidade & Status</h2>
-            <p>Status das tratativas, satisfação e avaliações.</p>
-          </div>
-        </div>
         <div class="home-footer">ikatec</div>
         <div class="home-updated">Atualizado: <span id="homeAtualizado"></span></div>
       </div>
     </section>
-    <section id="page-geral" class="page">
-      <div class="hero"><div class="hero-title"><div class="h-left"><span class="icon-badge"><i data-lucide="chart-line"></i></span><h1>Visão Geral</h1></div><div class="return" title="Limpar filtros" onclick="resetFiltrosPagina()"><i data-lucide="rotate-ccw"></i></div></div><div class="filters three"><div class="fg"><label>Ano</label><select id="gAno" multiple></select></div><div class="fg"><label>Mês</label><select id="gMes" multiple></select></div><div class="fg"><label>Departamento</label><select id="gDepto" multiple></select></div></div></div>
+    <section id="page-geral" class="page report-section">
+      <div class="hero"><div class="hero-title"><div class="h-left"><span class="icon-badge"><i data-lucide="chart-line"></i></span><div class="section-heading"><h1>Visão Geral</h1><div class="hero-subtitle">KPIs, evolução mensal e canais de entrada.</div></div></div><div class="return" title="Limpar filtros" onclick="resetFiltrosPagina()"><i data-lucide="rotate-ccw"></i></div></div><div class="filters three"><div class="fg"><label>Ano</label><select id="gAno" multiple></select></div><div class="fg"><label>Mês</label><select id="gMes" multiple></select></div><div class="fg"><label>Departamento</label><select id="gDepto" multiple></select></div></div></div>
       <div class="card round">
         <div class="ra-cards-all">
           <div class="ra-card ra-card-kpi">
@@ -437,22 +445,22 @@ html = r'''
       <div class="card round"><div class="chart-grid-2"><div class="chart-box"><h3>Reclamações por Mês e Ano</h3><div id="chartMesAno" class="plot"></div></div><div class="chart-box"><h3>Reclamações Instagram</h3><div id="chartInstagram" class="plot"></div></div><div class="chart-box"><h3>Reclamações Reclame Aqui</h3><div id="chartRA" class="plot"></div></div><div class="chart-box"><h3>Reclamações Google</h3><div id="chartGoogle" class="plot"></div></div></div></div>
     </section>
 
-    <section id="page-depto" class="page">
-      <div class="hero"><div class="hero-title"><div class="h-left"><span class="icon-badge"><i data-lucide="building-2"></i></span><h1>Participação das Áreas nas Ocorrências</h1></div><div class="return" title="Limpar filtros" onclick="resetFiltrosPagina()"><i data-lucide="rotate-ccw"></i></div></div><div class="filters three"><div class="fg"><label>Ano</label><select id="dAno" multiple></select></div><div class="fg"><label>Mês</label><select id="dMes" multiple></select></div><div class="fg"><label>Canal de Reclamação</label><select id="dCanal" multiple></select></div></div></div>
+    <section id="page-depto" class="page report-section">
+      <div class="hero"><div class="hero-title"><div class="h-left"><span class="icon-badge"><i data-lucide="building-2"></i></span><div class="section-heading"><h1>Participação das Áreas nas Ocorrências</h1><div class="hero-subtitle">Distribuição das ocorrências por área responsável.</div></div></div><div class="return" title="Limpar filtros" onclick="resetFiltrosPagina()"><i data-lucide="rotate-ccw"></i></div></div><div class="filters three"><div class="fg"><label>Ano</label><select id="dAno" multiple></select></div><div class="fg"><label>Mês</label><select id="dMes" multiple></select></div><div class="fg"><label>Canal de Reclamação</label><select id="dCanal" multiple></select></div></div></div>
       <div class="card round"><h3 class="section-title">Participação das Áreas nas Ocorrências</h3><div id="chartDeptoAno" class="dept-main"></div></div>
       <div class="card round"><h3 class="section-title" id="tituloDeptoMes">Reclamações 2026</h3><div id="chartDeptoMes" class="month-dept"></div></div>
       <div class="card round summary"><h3>Resumo Executivo</h3><div id="resumoDepto"></div></div>
     </section>
 
-    <section id="page-motivos" class="page">
-      <div class="hero"><div class="hero-title"><div class="h-left"><span class="icon-badge"><i data-lucide="clipboard-list"></i></span><h1>Motivos & Ocorrências</h1></div><div class="return" title="Limpar filtros" onclick="resetFiltrosPagina()"><i data-lucide="rotate-ccw"></i></div></div><div class="filters"><div class="fg"><label>Ano</label><select id="mAno" multiple></select></div><div class="fg"><label>Mês</label><select id="mMes" multiple></select></div><div class="fg"><label>Departamento</label><select id="mDepto" multiple></select></div><div class="fg"><label>Canal Reclamação</label><select id="mCanal" multiple></select></div></div></div>
+    <section id="page-motivos" class="page report-section">
+      <div class="hero"><div class="hero-title"><div class="h-left"><span class="icon-badge"><i data-lucide="clipboard-list"></i></span><div class="section-heading"><h1>Motivos & Ocorrências</h1><div class="hero-subtitle">Principais motivos, padrões e base analítica.</div></div></div><div class="return" title="Limpar filtros" onclick="resetFiltrosPagina()"><i data-lucide="rotate-ccw"></i></div></div><div class="filters"><div class="fg"><label>Ano</label><select id="mAno" multiple></select></div><div class="fg"><label>Mês</label><select id="mMes" multiple></select></div><div class="fg"><label>Departamento</label><select id="mDepto" multiple></select></div><div class="fg"><label>Canal Reclamação</label><select id="mCanal" multiple></select></div></div></div>
       <h2 style="margin:0 0 4px;font-size:24px">Motivos das Participação das Áreas nas Ocorrências</h2><div class="small-muted" id="periodoMotivos"></div><br>
       <div class="motivos-grid" id="motivoCards"></div>
       <div class="card round base-analitica"><div class="analytics-head"><div><h2 style="margin:0">Base Analítica</h2><div class="small-muted" id="periodoBase"></div></div><div class="btns"><button class="btn primary" onclick="baixarCSV()">Baixar CSV filtrado</button><button class="btn" onclick="copiarCSV()">Copiar CSV</button><button class="btn" onclick="mostrarCSV()">Mostrar CSV</button></div></div><textarea id="csvText" class="csvbox"></textarea><br><div class="table-wrap" id="tabelaMotivos"></div></div>
     </section>
 
-    <section id="page-qualidade" class="page">
-      <div class="hero"><div class="hero-title"><div class="h-left"><span class="icon-badge"><i data-lucide="headphones"></i></span><h1>Qualidade & Status</h1></div><div class="return" title="Limpar filtros" onclick="resetFiltrosPagina()"><i data-lucide="rotate-ccw"></i></div></div><div class="filters"><div class="fg"><label>Ano</label><select id="qAno" multiple></select></div><div class="fg"><label>Mês</label><select id="qMes" multiple></select></div><div class="fg"><label>Departamento</label><select id="qDepto" multiple></select></div><div class="fg"><label>Canal Reclamação</label><select id="qCanal" multiple></select></div></div></div>
+    <section id="page-qualidade" class="page report-section">
+      <div class="hero"><div class="hero-title"><div class="h-left"><span class="icon-badge"><i data-lucide="headphones"></i></span><div class="section-heading"><h1>Qualidade & Status</h1><div class="hero-subtitle">Status das tratativas, satisfação e avaliações.</div></div></div><div class="return" title="Limpar filtros" onclick="resetFiltrosPagina()"><i data-lucide="rotate-ccw"></i></div></div><div class="filters"><div class="fg"><label>Ano</label><select id="qAno" multiple></select></div><div class="fg"><label>Mês</label><select id="qMes" multiple></select></div><div class="fg"><label>Departamento</label><select id="qDepto" multiple></select></div><div class="fg"><label>Canal Reclamação</label><select id="qCanal" multiple></select></div></div></div>
       <div class="quality-grid"><div><h2>Fases Atuais</h2><div class="small-muted" id="periodoQ1"></div><div class="tag-scroll"><div id="statusCards"></div></div></div><div><h2>Etiquetas por Fase Atual</h2><div class="small-muted" id="periodoQ2"></div><div class="tag-scroll"><div id="tagCards"></div></div></div><div><h2>Satisfação do Cliente</h2><div class="small-muted" id="periodoQ4"></div><div class="mini-kpis"><div class="mini-card"><div class="mini-title"><span>Problema Resolvido</span><span class="info-tip" data-tip="Conta as respostas da coluna 'Problema resolvido?'. Sim = reclamações marcadas como resolvidas. Não = reclamações marcadas como não resolvidas. Respostas vazias ou diferentes de Sim/Não não entram nesse card.">i</span></div><div class="yesno"><div>Sim<br><span class="big-cyan" id="qSim">0</span></div><div>Não<br><span class="big-cyan" id="qNao">0</span></div></div></div><div class="mini-card"><div class="mini-title"><span>% Resolvidas</span><span class="info-tip" data-tip="Cálculo: quantidade de respostas 'Sim' em Problema resolvido ÷ total de respostas Sim + Não em Problema resolvido × 100.">i</span></div><div class="big-cyan" id="qPercResolvido">0%</div><div class="small-muted" id="qTxtResolvido"></div></div><div class="mini-card"><div class="mini-title"><span>Voltaria a Fazer Negócio</span><span class="info-tip" data-tip="Conta as respostas da coluna 'Voltaria a fazer negócio?'. Sim = clientes que voltariam a fazer negócio. Não = clientes que não voltariam. Respostas vazias ou diferentes de Sim/Não não entram nesse card.">i</span></div><div class="yesno"><div>Sim<br><span class="big-cyan" id="vSim">0</span></div><div>Não<br><span class="big-cyan" id="vNao">0</span></div></div></div><div class="mini-card"><div class="mini-title"><span>% Voltaria a Fazer Negócio</span><span class="info-tip" data-tip="Cálculo: quantidade de respostas 'Sim' em Voltaria a fazer negócio ÷ total de respostas Sim + Não em Voltaria a fazer negócio × 100.">i</span></div><div class="big-cyan" id="vPerc">0%</div><div class="small-muted" id="vTxt"></div></div></div><div class="card round"><h2>Notas das Avaliações</h2><div class="small-muted" id="periodoQ3"></div><br><div id="notasBox"></div></div></div></div>
     </section>
   </main>
@@ -463,7 +471,7 @@ const DATA=__PAYLOAD_JSON__; const MESES=DATA.meses;
 const C1="#1d8ff2", C2="#182f9f", CY="#19b5cf", MUT="#71829a";
 function id(x){return document.getElementById(x)}
 function toast(t){id('toast').textContent=t;id('toast').style.display='block';setTimeout(()=>id('toast').style.display='none',2600)}
-function showPage(p,el){document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'));id('page-'+p).classList.add('active');document.querySelector('.app').classList.toggle('home-mode',p==='home');document.querySelectorAll('.nav').forEach(x=>x.classList.remove('active'));let navMap={home:0,geral:1,depto:2,motivos:3,qualidade:4};let navs=document.querySelectorAll('.nav');if(el)el.classList.add('active');else if(navs[navMap[p]])navs[navMap[p]].classList.add('active');renderAll();if(window.lucide){lucide.createIcons();}}
+function showPage(p,el){const alvo=id('page-'+p);if(alvo)alvo.scrollIntoView({behavior:'smooth',block:'start'});if(window.lucide){lucide.createIcons();}}
 function fill(sel,vals,all='Todos'){sel.innerHTML=`<option value="Todos">${all}</option>`; vals.forEach(v=>sel.innerHTML+=`<option value="${String(v).replace(/"/g,'&quot;')}">${v}</option>`)}
 function fillMes(sel){sel.innerHTML='<option value="Todos">Todos</option>'; MESES.forEach(m=>sel.innerHTML+=`<option value="${m.num}">${m.nome}</option>`)}
 function getVals(sel){let vals=[...sel.selectedOptions].map(o=>o.value);if(!vals.length||vals.includes('Todos'))return ['Todos'];return vals}
@@ -822,10 +830,10 @@ function refreshMultiSelectDisplays(){
   });
 }
 
-function renderAll(){if(id('page-home').classList.contains('active')){if(window.lucide){lucide.createIcons();}return;}if(id('page-geral').classList.contains('active'))renderGeral();if(id('page-depto').classList.contains('active'))renderDepto();if(id('page-motivos').classList.contains('active'))renderMotivos();if(id('page-qualidade').classList.contains('active'))renderQualidade();if(window.lucide){lucide.createIcons();}}
-function resetFiltrosPagina(){let p=document.querySelector('.page.active').id.replace('page-','');if(p==='home')return;document.querySelectorAll('select').forEach(sel=>{[...sel.options].forEach(o=>o.selected=false);if(sel.options[0])sel.options[0].selected=true});refreshMultiSelectDisplays();renderAll();toast('Filtros limpos em todas as páginas.')}
+function renderAll(){renderGeral();renderDepto();renderMotivos();renderQualidade();if(window.lucide){lucide.createIcons();}}
+function resetFiltrosPagina(){document.querySelectorAll('select').forEach(sel=>{[...sel.options].forEach(o=>o.selected=false);if(sel.options[0])sel.options[0].selected=true});refreshMultiSelectDisplays();renderAll();toast('Filtros limpos em todo o relatório.')}
 function setSelectOnly(sel,val){[...sel.options].forEach(o=>o.selected=String(o.value)===String(val));refreshMultiSelectDisplays();}
-function init(){document.querySelector('.app').classList.add('home-mode'); if(id('homeAtualizado')) id('homeAtualizado').textContent=DATA.atualizado;['g', 'm', 'q'].forEach(p=>{fill(id(p+'Ano'),DATA.anos);fillMes(id(p+'Mes'));fill(id(p+'Depto'),DATA.departamentos);if(id(p+'Canal'))fill(id(p+'Canal'),DATA.canais)});fill(id('dAno'),DATA.anos);fillMes(id('dMes'));fill(id('dCanal'),DATA.canais);document.querySelectorAll('select').forEach(s=>s.addEventListener('change',()=>atualizarFiltroERenderizar(s)));enhanceMultiSelects();if(DATA.anos.includes(2026)){['mAno', 'qAno'].forEach(x=>setSelectOnly(id(x),'2026'))}renderAll()}
+function init(){if(id('homeAtualizado')) id('homeAtualizado').textContent=DATA.atualizado;['g', 'm', 'q'].forEach(p=>{fill(id(p+'Ano'),DATA.anos);fillMes(id(p+'Mes'));fill(id(p+'Depto'),DATA.departamentos);if(id(p+'Canal'))fill(id(p+'Canal'),DATA.canais)});fill(id('dAno'),DATA.anos);fillMes(id('dMes'));fill(id('dCanal'),DATA.canais);document.querySelectorAll('select').forEach(s=>s.addEventListener('change',()=>atualizarFiltroERenderizar(s)));enhanceMultiSelects();if(DATA.anos.includes(2026)){['mAno', 'qAno'].forEach(x=>setSelectOnly(id(x),'2026'))}renderAll()}
 init();
 if(window.lucide){lucide.createIcons();}
 </script>
@@ -835,7 +843,38 @@ if(window.lucide){lucide.createIcons();}
 
 html = html.replace("__PAYLOAD_JSON__", payload_json)
 ARQUIVO_SAIDA.write_text(html, encoding="utf-8")
+ARQUIVO_INDEX.write_text(html, encoding="utf-8")
 
 print(f"HTML gerado com sucesso em: {ARQUIVO_SAIDA}")
+print(f"Cópia para publicação gerada em: {ARQUIVO_INDEX}")
 print(f"Base analítica completa exportada em: {ARQUIVO_BASE_COMPLETA}")
 print("Observação: dentro do Power BI alguns visuais HTML bloqueiam download. Nesse caso, use o botão 'Copiar CSV' ou 'Mostrar CSV'.")
+
+# ============================================================
+# PUBLICAÇÃO AUTOMÁTICA NO GITHUB (atualiza a URL do GitHub Pages)
+# Requer Git instalado e autenticado (gh auth login) nesta máquina.
+# ============================================================
+def publicar_no_github():
+    try:
+        subprocess.run(
+            ["git", "add", "index.html", NOME_SCRIPT],
+            cwd=PASTA_SAIDA, check=True, capture_output=True, text=True
+        )
+        commit = subprocess.run(
+            ["git", "commit", "-m", f"Atualiza painel - {DATA_ATUALIZACAO}"],
+            cwd=PASTA_SAIDA, capture_output=True, text=True
+        )
+        if commit.returncode != 0:
+            if "nothing to commit" in commit.stdout:
+                print("Nenhuma alteração para publicar no GitHub.")
+            else:
+                print(f"[AVISO] git commit: {commit.stdout}{commit.stderr}")
+            return
+        subprocess.run(["git", "push"], cwd=PASTA_SAIDA, check=True, capture_output=True, text=True)
+        print("Painel publicado com sucesso no GitHub (o GitHub Pages atualiza em alguns instantes).")
+    except FileNotFoundError:
+        print("[AVISO] Git não encontrado no PATH. Não foi possível publicar automaticamente.")
+    except subprocess.CalledProcessError as e:
+        print(f"[AVISO] Não foi possível publicar automaticamente no GitHub: {e.stderr or e}")
+
+publicar_no_github()
